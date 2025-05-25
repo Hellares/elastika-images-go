@@ -340,7 +340,17 @@ func (s *ImageServer) isAllowedFileType(mimeType string) bool {
 
 func (s *ImageServer) deleteHandler(c *gin.Context) {
 	relativePath := c.Param("path")
+	
+	// Decodificar URL si es necesario
+	if decoded, err := url.QueryUnescape(relativePath); err == nil {
+		relativePath = decoded
+	}
+	
 	filePath := filepath.Join(s.ImagesDir, relativePath)
+
+	logger.Info("Intentando eliminar archivo",
+		zap.String("relativePath", relativePath),
+		zap.String("fullPath", filePath))
 
 	// Verificar que el archivo existe
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
@@ -350,11 +360,14 @@ func (s *ImageServer) deleteHandler(c *gin.Context) {
 
 	// Eliminar archivo
 	if err := os.Remove(filePath); err != nil {
+		logger.Error("Error al eliminar archivo",
+			zap.String("path", filePath),
+			zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al eliminar archivo"})
 		return
 	}
 
-	log.Printf("Archivo eliminado: %s", filePath)
+	logger.Info("Archivo eliminado exitosamente", zap.String("path", filePath))
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"path":    relativePath,
@@ -421,8 +434,8 @@ func (s *ImageServer) listHandler(c *gin.Context) {
 }
 
 func (s *ImageServer) serveFileHandler(c *gin.Context) {
-	// Usar c.Param("path") con el wildcard *path
-	relativePath := strings.TrimPrefix(c.Param("path"), "/")
+	// Usar c.Param("path") - ahora captura todo después de /files/
+	relativePath := c.Param("path")
 	
 	// Decodificar URL si es necesario
 	if decoded, err := url.QueryUnescape(relativePath); err == nil {
@@ -465,6 +478,7 @@ func (s *ImageServer) serveFileHandler(c *gin.Context) {
 	// Servir archivo
 	c.File(filePath)
 }
+
 
 func (s *ImageServer) quotaHandler(c *gin.Context) {
 	tenantID := c.Param("tenantId")
