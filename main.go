@@ -554,7 +554,6 @@ func (s *ImageServer) serveFileHandler(c *gin.Context) {
 	c.File(filePath)
 }
 
-
 func (s *ImageServer) quotaHandler(c *gin.Context) {
 	tenantID := c.Param("tenantId")
 
@@ -621,20 +620,37 @@ func (s *ImageServer) healthHandler(c *gin.Context) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 
+	// Verificar que el directorio de imágenes sea accesible
+	_, err := os.Stat(s.ImagesDir)
+	isHealthy := err == nil
+
+	status := "ok"
+	httpStatus := http.StatusOK
+	if !isHealthy {
+		status = "error"
+		httpStatus = http.StatusServiceUnavailable
+	}
+
 	response := HealthResponse{
-		Status:  "ok",
+		Status:  status,
 		Version: getEnv("VERSION", "1.0.0"),
 		Uptime:  time.Now().Unix() - startTime,
 		MemoryUsage: map[string]interface{}{
-			"alloc":      m.Alloc,
-			"totalAlloc": m.TotalAlloc,
-			"sys":        m.Sys,
+			"alloc":      formatSize(int64(m.Alloc)),
+			"totalAlloc": formatSize(int64(m.TotalAlloc)),
+			"sys":        formatSize(int64(m.Sys)),
 			"numGC":      m.NumGC,
 		},
 		Environment: getEnv("NODE_ENV", "development"),
 	}
 
-	c.JSON(http.StatusOK, response)
+	// Para HEAD requests, solo devolver headers
+	if c.Request.Method == "HEAD" {
+		c.Status(httpStatus)
+		return
+	}
+
+	c.JSON(httpStatus, response)
 }
 
 var startTime int64
@@ -693,7 +709,7 @@ func main() {
 
 	if env == "production" {
 		// En producción, solo permitir orígenes específicos
-		corsConfig.AllowOrigins = []string{getEnv("ALLOWED_ORIGINS", "http://localhost:3000")}
+		corsConfig.AllowOrigins = strings.Split(getEnv("ALLOWED_ORIGINS", "http://localhost:3000"), ",")
 	} else {
 		// En desarrollo, permitir todos los orígenes
 		corsConfig.AllowAllOrigins = true
@@ -701,10 +717,14 @@ func main() {
 
 	r.Use(cors.New(corsConfig))
 
-	// Rutas públicas
+	// ========================================
+	// RUTAS PÚBLICAS
+	// ========================================
+	
+	// Health check
 	r.GET("/health", server.healthHandler)
-	r.HEAD("/health", server.healthHandler) // Agregar soporte para HEAD
-
+	r.HEAD("/health", server.healthHandler)
+	
 	// Root endpoint
 	r.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
@@ -715,10 +735,9 @@ func main() {
 	})
 
 	// ========================================
-	// RUTAS DE ARCHIVOS - ORDEN CRÍTICO
+	// RUTAS DE ARCHIVOS - USANDO GRUPO
 	// ========================================
 	
-	// USAR GRUPO para evitar conflictos con wildcard
 	filesGroup := r.Group("/files")
 	{
 		// Ruta específica PRIMERO
@@ -737,7 +756,7 @@ func main() {
 	{
 		protected.POST("/upload", server.uploadHandler)
 		
-		// Delete también usando wildcard
+		// Delete también usando wildcard en grupo
 		protectedFiles := protected.Group("/files")
 		{
 			protectedFiles.DELETE("/*filepath", server.deleteHandler)
@@ -746,10 +765,11 @@ func main() {
 		protected.GET("/quota/:tenantId", server.quotaHandler)
 	}
 
-	logger.Info("Servidor iniciado con rutas wildcard",
+	logger.Info("Servidor iniciado exitosamente",
 		zap.String("port", server.Port),
 		zap.String("imagesDir", server.ImagesDir),
-		zap.String("environment", env))
+		zap.String("environment", env),
+		zap.String("publicURL", server.PublicURL))
 
 	r.Run(":" + server.Port)
 }
