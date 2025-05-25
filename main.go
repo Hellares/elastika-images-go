@@ -625,7 +625,7 @@ func main() {
 
 	// Rutas de archivos
 	r.GET("/files/list", server.listHandler)
-	r.GET("/files/*path", server.serveFileHandler)
+	r.GET("/files/:path", server.serveFileHandler)
 
 	// Rutas protegidas
 	protected := r.Group("/")
