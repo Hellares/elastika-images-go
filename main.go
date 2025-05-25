@@ -339,7 +339,17 @@ func (s *ImageServer) isAllowedFileType(mimeType string) bool {
 }
 
 func (s *ImageServer) deleteHandler(c *gin.Context) {
-	relativePath := c.Param("path")
+	// Usar filepath con wildcard
+	relativePath := strings.TrimPrefix(c.Param("filepath"), "/")
+	
+	logger.Info("Request para eliminar archivo",
+		zap.String("rawFilepath", c.Param("filepath")),
+		zap.String("relativePath", relativePath))
+	
+	if relativePath == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Ruta de archivo requerida"})
+		return
+	}
 	
 	// Decodificar URL si es necesario
 	if decoded, err := url.QueryUnescape(relativePath); err == nil {
@@ -354,6 +364,8 @@ func (s *ImageServer) deleteHandler(c *gin.Context) {
 
 	// Verificar que el archivo existe
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		logger.Warn("Archivo no encontrado para eliminar",
+			zap.String("path", filePath))
 		c.JSON(http.StatusNotFound, gin.H{"error": "Archivo no encontrado"})
 		return
 	}
@@ -434,17 +446,37 @@ func (s *ImageServer) listHandler(c *gin.Context) {
 }
 
 func (s *ImageServer) serveFileHandler(c *gin.Context) {
-	// Usar c.Param("path") - ahora captura todo después de /files/
-	relativePath := c.Param("path")
+	// Con wildcard /*filepath, usar "filepath" en lugar de "path"
+	// Wildcard incluye la barra inicial, así que la quitamos
+	relativePath := strings.TrimPrefix(c.Param("filepath"), "/")
+	
+	// Log para debugging
+	logger.Info("Request para servir archivo",
+		zap.String("rawFilepath", c.Param("filepath")),
+		zap.String("relativePath", relativePath),
+		zap.String("requestURL", c.Request.URL.String()))
+	
+	// Verificar que no esté vacío
+	if relativePath == "" {
+		logger.Warn("Path vacío en request")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Ruta de archivo requerida"})
+		return
+	}
 	
 	// Decodificar URL si es necesario
 	if decoded, err := url.QueryUnescape(relativePath); err == nil {
-		relativePath = decoded
+		if decoded != relativePath {
+			logger.Info("Path decodificado",
+				zap.String("original", relativePath),
+				zap.String("decoded", decoded))
+			relativePath = decoded
+		}
 	}
 	
+	// Construir path completo
 	filePath := filepath.Join(s.ImagesDir, relativePath)
 
-	logger.Info("Sirviendo archivo",
+	logger.Info("Intentando servir archivo",
 		zap.String("relativePath", relativePath),
 		zap.String("fullPath", filePath))
 
@@ -453,7 +485,25 @@ func (s *ImageServer) serveFileHandler(c *gin.Context) {
 	if os.IsNotExist(err) {
 		logger.Warn("Archivo no encontrado",
 			zap.String("path", filePath))
-		c.JSON(http.StatusNotFound, gin.H{"error": "Archivo no encontrado"})
+		
+		// Debugging: listar archivos del directorio
+		dir := filepath.Dir(filePath)
+		if entries, err := os.ReadDir(dir); err == nil {
+			var files []string
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					files = append(files, entry.Name())
+				}
+			}
+			logger.Info("Archivos disponibles en directorio",
+				zap.String("directory", dir),
+				zap.Strings("files", files))
+		}
+		
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "Archivo no encontrado",
+			"path":  relativePath,
+		})
 		return
 	}
 
@@ -467,13 +517,38 @@ func (s *ImageServer) serveFileHandler(c *gin.Context) {
 
 	// Verificar que no es un directorio
 	if fileInfo.IsDir() {
+		logger.Warn("Ruta es un directorio",
+			zap.String("path", filePath))
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Ruta especificada es un directorio"})
 		return
 	}
 
-	// Configurar headers de caché
+	// Detectar tipo de contenido
+	ext := strings.ToLower(filepath.Ext(filePath))
+	contentType := "application/octet-stream"
+	
+	switch ext {
+	case ".jpg", ".jpeg":
+		contentType = "image/jpeg"
+	case ".png":
+		contentType = "image/png"
+	case ".gif":
+		contentType = "image/gif"
+	case ".webp":
+		contentType = "image/webp"
+	case ".pdf":
+		contentType = "application/pdf"
+	}
+
+	// Configurar headers
+	c.Header("Content-Type", contentType)
 	c.Header("Cache-Control", "public, max-age=31536000, immutable")
 	c.Header("Content-Length", fmt.Sprintf("%d", fileInfo.Size()))
+
+	logger.Info("Sirviendo archivo exitosamente",
+		zap.String("path", filePath),
+		zap.String("contentType", contentType),
+		zap.Int64("size", fileInfo.Size()))
 
 	// Servir archivo
 	c.File(filePath)
@@ -629,6 +704,8 @@ func main() {
 	// Rutas públicas
 	r.GET("/health", server.healthHandler)
 	r.HEAD("/health", server.healthHandler) // Agregar soporte para HEAD
+
+	// Root endpoint
 	r.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"service": "Elastika Images Server",
@@ -637,24 +714,42 @@ func main() {
 		})
 	})
 
-	// Rutas de archivos
-	r.GET("/files/list", server.listHandler)
-	r.GET("/files/:path", server.serveFileHandler)
+	// ========================================
+	// RUTAS DE ARCHIVOS - ORDEN CRÍTICO
+	// ========================================
+	
+	// USAR GRUPO para evitar conflictos con wildcard
+	filesGroup := r.Group("/files")
+	{
+		// Ruta específica PRIMERO
+		filesGroup.GET("/list", server.listHandler)
+		
+		// Wildcard DESPUÉS - captura todo incluyendo barras
+		filesGroup.GET("/*filepath", server.serveFileHandler)
+	}
 
-	// Rutas protegidas
+	// ========================================
+	// RUTAS PROTEGIDAS
+	// ========================================
+	
 	protected := r.Group("/")
 	protected.Use(server.authMiddleware())
 	{
 		protected.POST("/upload", server.uploadHandler)
-		protected.DELETE("/files/:path", server.deleteHandler)
+		
+		// Delete también usando wildcard
+		protectedFiles := protected.Group("/files")
+		{
+			protectedFiles.DELETE("/*filepath", server.deleteHandler)
+		}
+		
 		protected.GET("/quota/:tenantId", server.quotaHandler)
 	}
 
-	logger.Info("Servidor iniciado",
+	logger.Info("Servidor iniciado con rutas wildcard",
 		zap.String("port", server.Port),
 		zap.String("imagesDir", server.ImagesDir),
-		zap.String("environment", env),
-		zap.Bool("production", env == "production"))
+		zap.String("environment", env))
 
 	r.Run(":" + server.Port)
 }
