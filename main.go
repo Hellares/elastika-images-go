@@ -2,14 +2,11 @@ package main
 
 import (
 	// "encoding/json"
-	"bytes"
 	"fmt"
-	"image"
-	"image/jpeg"
-	"image/png"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -189,20 +186,48 @@ func (s *ImageServer) uploadHandler(c *gin.Context) {
 		return
 	}
 
-	mimeType := header.Header.Get("Content-Type")
+	// Detectar tipo de archivo del contenido real
+	buffer := make([]byte, 512)
+	_, err = file.Read(buffer)
+	if err != nil {
+		logger.Error("Error al leer archivo para detectar tipo", zap.Error(err))
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Error al procesar archivo"})
+		return
+	}
+	
+	// Resetear el reader al inicio
+	file.Seek(0, 0)
+	
+	mimeType := http.DetectContentType(buffer)
+	
+	// Si no se detecta correctamente, usar el header
+	if mimeType == "application/octet-stream" {
+		mimeType = header.Header.Get("Content-Type")
+	}
+
 	// Validar tipo de archivo
 	if !s.isAllowedFileType(mimeType) {
 		logger.Warn("Tipo de archivo no permitido",
-			zap.String("mimeType", mimeType))
+			zap.String("mimeType", mimeType),
+			zap.String("detectedType", http.DetectContentType(buffer)),
+			zap.String("headerType", header.Header.Get("Content-Type")))
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": fmt.Sprintf("Tipo de archivo no permitido: %s", mimeType),
 		})
 		return
 	}
 
-	// Obtener tenant
+	// Obtener y decodificar tenant ID
 	tenantID := c.Query("path")
 	if tenantID != "" {
+		// Decodificar URL
+		decoded, err := url.QueryUnescape(tenantID)
+		if err != nil {
+			logger.Warn("Error al decodificar path", zap.String("path", tenantID), zap.Error(err))
+		} else {
+			tenantID = decoded
+		}
+		
 		parts := strings.Split(tenantID, "/")
 		tenantID = parts[0]
 	}
@@ -229,17 +254,14 @@ func (s *ImageServer) uploadHandler(c *gin.Context) {
 	filename := fmt.Sprintf("%d-%s", timestamp, safeName)
 	filePath := filepath.Join(tenantDir, filename)
 
-	// Comprimir imagen si es necesario
-	compressedFile, err := s.compressImage(file, mimeType)
-	if err != nil {
-		logger.Error("Error al comprimir imagen",
-			zap.String("filename", filename),
-			zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al procesar imagen"})
-		return
-	}
+	logger.Info("Iniciando guardado de archivo",
+		zap.String("tenantID", tenantID),
+		zap.String("filename", filename),
+		zap.String("originalName", header.Filename),
+		zap.String("mimeType", mimeType),
+		zap.Int64("size", header.Size))
 
-	// Crear archivo
+	// Crear archivo directamente - SIN COMPRESIÓN
 	dst, err := os.Create(filePath)
 	if err != nil {
 		logger.Error("Error al crear archivo",
@@ -250,11 +272,14 @@ func (s *ImageServer) uploadHandler(c *gin.Context) {
 	}
 	defer dst.Close()
 
-	// Copiar contenido
-	if _, err := io.Copy(dst, compressedFile); err != nil {
+	// Copiar contenido directamente desde el archivo original
+	bytesWritten, err := io.Copy(dst, file)
+	if err != nil {
 		logger.Error("Error al guardar archivo",
 			zap.String("path", filePath),
 			zap.Error(err))
+		// Limpiar archivo parcial en caso de error
+		os.Remove(filePath)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al guardar archivo"})
 		return
 	}
@@ -262,7 +287,7 @@ func (s *ImageServer) uploadHandler(c *gin.Context) {
 	// Establecer permisos
 	os.Chmod(filePath, 0644)
 
-	// Obtener tamaño final del archivo
+	// Obtener información final del archivo
 	fileInfo, err := os.Stat(filePath)
 	if err != nil {
 		logger.Error("Error al obtener información del archivo",
@@ -286,8 +311,10 @@ func (s *ImageServer) uploadHandler(c *gin.Context) {
 
 	logger.Info("Archivo guardado exitosamente",
 		zap.String("path", filePath),
-		zap.Int64("size", fileInfo.Size()),
-		zap.String("mimeType", mimeType))
+		zap.Int64("bytesWritten", bytesWritten),
+		zap.Int64("finalSize", fileInfo.Size()),
+		zap.String("mimeType", mimeType),
+		zap.String("publicURL", publicURL))
 
 	c.JSON(http.StatusCreated, response)
 }
@@ -309,33 +336,6 @@ func (s *ImageServer) isAllowedFileType(mimeType string) bool {
 
 	_, exists := allowed[mimeType]
 	return exists
-}
-
-func (s *ImageServer) compressImage(src io.Reader, mimeType string) (io.Reader, error) {
-	if !strings.HasPrefix(mimeType, "image/") {
-		return src, nil
-	}
-
-	img, _, err := image.Decode(src)
-	if err != nil {
-		return nil, fmt.Errorf("error al decodificar imagen: %v", err)
-	}
-
-	var buf bytes.Buffer
-	switch mimeType {
-	case "image/jpeg":
-		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 85}); err != nil {
-			return nil, err
-		}
-	case "image/png":
-		if err := png.Encode(&buf, img); err != nil {
-			return nil, err
-		}
-	default:
-		return src, nil
-	}
-
-	return &buf, nil
 }
 
 func (s *ImageServer) deleteHandler(c *gin.Context) {
@@ -421,17 +421,46 @@ func (s *ImageServer) listHandler(c *gin.Context) {
 }
 
 func (s *ImageServer) serveFileHandler(c *gin.Context) {
-	relativePath := c.Param("path")
+	// Usar c.Param("path") con el wildcard *path
+	relativePath := strings.TrimPrefix(c.Param("path"), "/")
+	
+	// Decodificar URL si es necesario
+	if decoded, err := url.QueryUnescape(relativePath); err == nil {
+		relativePath = decoded
+	}
+	
 	filePath := filepath.Join(s.ImagesDir, relativePath)
 
+	logger.Info("Sirviendo archivo",
+		zap.String("relativePath", relativePath),
+		zap.String("fullPath", filePath))
+
 	// Verificar que el archivo existe
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+	fileInfo, err := os.Stat(filePath)
+	if os.IsNotExist(err) {
+		logger.Warn("Archivo no encontrado",
+			zap.String("path", filePath))
 		c.JSON(http.StatusNotFound, gin.H{"error": "Archivo no encontrado"})
+		return
+	}
+
+	if err != nil {
+		logger.Error("Error al acceder archivo",
+			zap.String("path", filePath),
+			zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al acceder archivo"})
+		return
+	}
+
+	// Verificar que no es un directorio
+	if fileInfo.IsDir() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Ruta especificada es un directorio"})
 		return
 	}
 
 	// Configurar headers de caché
 	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	c.Header("Content-Length", fmt.Sprintf("%d", fileInfo.Size()))
 
 	// Servir archivo
 	c.File(filePath)
@@ -585,10 +614,18 @@ func main() {
 
 	// Rutas públicas
 	r.GET("/health", server.healthHandler)
+	r.HEAD("/health", server.healthHandler) // Agregar soporte para HEAD
+	r.GET("/", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"service": "Elastika Images Server",
+			"status":  "running",
+			"version": getEnv("VERSION", "1.0.0"),
+		})
+	})
 
 	// Rutas de archivos
 	r.GET("/files/list", server.listHandler)
-	r.GET("/files/:path", server.serveFileHandler)
+	r.GET("/files/*path", server.serveFileHandler)
 
 	// Rutas protegidas
 	protected := r.Group("/")
