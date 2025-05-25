@@ -1,0 +1,37 @@
+# Binarios
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+main
+
+# Archivos de test
+*.test
+
+# Output de go coverage
+*.out
+
+# Archivos de entorno (no subir .env real)
+.env
+
+# Dependencias de go
+vendor/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Directorio de imágenes local
+images/
+uploads/

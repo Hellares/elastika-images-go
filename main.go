@@ -1,0 +1,609 @@
+package main
+
+import (
+	// "encoding/json"
+	"bytes"
+	"fmt"
+	"image"
+	"image/jpeg"
+	"image/png"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+)
+
+var logger *zap.Logger
+
+func initLogger() {
+	config := zap.NewProductionConfig()
+	config.EncoderConfig.TimeKey = "timestamp"
+	config.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+
+	var err error
+	logger, err = config.Build()
+	if err != nil {
+		log.Fatal("Error al inicializar logger:", err)
+	}
+}
+
+type ImageServer struct {
+	ImagesDir   string
+	APIKey      string
+	PublicURL   string
+	MaxFileSize int64
+	Port        string
+}
+
+type UploadResponse struct {
+	Path         string `json:"path"`
+	URL          string `json:"url"`
+	Size         int64  `json:"size"`
+	MimeType     string `json:"mimetype"`
+	Filename     string `json:"filename"`
+	OriginalName string `json:"originalName"`
+	TenantID     string `json:"tenantId"`
+}
+
+type FileInfo struct {
+	Name       string    `json:"name"`
+	Path       string    `json:"path"`
+	Size       int64     `json:"size"`
+	CreatedAt  time.Time `json:"createdAt"`
+	ModifiedAt time.Time `json:"modifiedAt"`
+	URL        string    `json:"url"`
+}
+
+type ListResponse struct {
+	Success  bool       `json:"success"`
+	Files    []FileInfo `json:"files"`
+	Count    int        `json:"count"`
+	TenantID string     `json:"tenantId"`
+}
+
+type QuotaResponse struct {
+	TenantID      string         `json:"tenantId"`
+	UsedBytes     int64          `json:"usedBytes"`
+	UsedFormatted string         `json:"usedFormatted"`
+	UsedMB        string         `json:"usedMB"`
+	FileCount     int            `json:"fileCount"`
+	FilesByType   map[string]int `json:"filesByType"`
+	LastCheck     string         `json:"lastCheck"`
+}
+
+type HealthResponse struct {
+	Status      string                 `json:"status"`
+	Version     string                 `json:"version"`
+	Uptime      int64                  `json:"uptime"`
+	MemoryUsage map[string]interface{} `json:"memoryUsage"`
+	Environment string                 `json:"environment"`
+}
+
+func NewImageServer() *ImageServer {
+	// Cargar variables de entorno
+	godotenv.Load()
+
+	maxFileSize, _ := strconv.ParseInt(getEnv("MAX_FILE_SIZE", "20"), 10, 64)
+	maxFileSize = maxFileSize * 1024 * 1024 // Convertir a bytes
+
+	return &ImageServer{
+		ImagesDir:   getEnv("IMAGES_DIR", "/var/www/images"),
+		APIKey:      getEnv("API_KEY", "mathidev369"),
+		PublicURL:   getEnv("PUBLIC_URL", "http://localhost:3500"),
+		MaxFileSize: maxFileSize,
+		Port:        getEnv("PORT", "3500"),
+	}
+}
+
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func (s *ImageServer) ensureImagesDir() error {
+	if err := os.MkdirAll(s.ImagesDir, 0755); err != nil {
+		return err
+	}
+	log.Printf("Usando directorio de imágenes: %s", s.ImagesDir)
+	return nil
+}
+
+func (s *ImageServer) ensureTenantDir(tenantID string) (string, error) {
+	// Validar tenantID para prevenir path traversal
+	matched, _ := regexp.MatchString(`^[a-zA-Z0-9_-]+$`, tenantID)
+	if !matched {
+		return "", fmt.Errorf("ID de tenant inválido")
+	}
+
+	tenantDir := filepath.Join(s.ImagesDir, tenantID)
+	if err := os.MkdirAll(tenantDir, 0755); err != nil {
+		return "", err
+	}
+	return tenantDir, nil
+}
+
+func (s *ImageServer) sanitizeFilename(filename string) string {
+	// Reemplazar caracteres no permitidos
+	reg := regexp.MustCompile(`[^a-zA-Z0-9_.-]`)
+	sanitized := reg.ReplaceAllString(filename, "_")
+
+	// Limitar longitud
+	if len(sanitized) > 200 {
+		sanitized = sanitized[:200]
+	}
+	return sanitized
+}
+
+func (s *ImageServer) authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHeader := c.GetHeader("Authorization")
+
+		if !strings.HasPrefix(authHeader, "Bearer ") {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Autenticación requerida"})
+			c.Abort()
+			return
+		}
+
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		if token != s.APIKey {
+			c.JSON(http.StatusForbidden, gin.H{"error": "API key inválida"})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
+
+func (s *ImageServer) uploadHandler(c *gin.Context) {
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		logger.Error("Error al obtener archivo", zap.Error(err))
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No se proporcionó ningún archivo"})
+		return
+	}
+	defer file.Close()
+
+	// Verificar tamaño del archivo
+	if header.Size > s.MaxFileSize {
+		logger.Warn("Archivo demasiado grande",
+			zap.Int64("size", header.Size),
+			zap.Int64("maxSize", s.MaxFileSize))
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"error": fmt.Sprintf("Archivo demasiado grande. El límite es %dMB", s.MaxFileSize/(1024*1024)),
+		})
+		return
+	}
+
+	mimeType := header.Header.Get("Content-Type")
+	// Validar tipo de archivo
+	if !s.isAllowedFileType(mimeType) {
+		logger.Warn("Tipo de archivo no permitido",
+			zap.String("mimeType", mimeType))
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("Tipo de archivo no permitido: %s", mimeType),
+		})
+		return
+	}
+
+	// Obtener tenant
+	tenantID := c.Query("path")
+	if tenantID != "" {
+		parts := strings.Split(tenantID, "/")
+		tenantID = parts[0]
+	}
+	if tenantID == "" {
+		tenantID = c.GetHeader("x-tenant-id")
+	}
+	if tenantID == "" {
+		tenantID = "default"
+	}
+
+	// Crear directorio del tenant
+	tenantDir, err := s.ensureTenantDir(tenantID)
+	if err != nil {
+		logger.Error("Error al crear directorio del tenant",
+			zap.String("tenantID", tenantID),
+			zap.Error(err))
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ID de tenant inválido"})
+		return
+	}
+
+	// Generar nombre de archivo único
+	timestamp := time.Now().UnixNano() / int64(time.Millisecond)
+	safeName := s.sanitizeFilename(header.Filename)
+	filename := fmt.Sprintf("%d-%s", timestamp, safeName)
+	filePath := filepath.Join(tenantDir, filename)
+
+	// Comprimir imagen si es necesario
+	compressedFile, err := s.compressImage(file, mimeType)
+	if err != nil {
+		logger.Error("Error al comprimir imagen",
+			zap.String("filename", filename),
+			zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al procesar imagen"})
+		return
+	}
+
+	// Crear archivo
+	dst, err := os.Create(filePath)
+	if err != nil {
+		logger.Error("Error al crear archivo",
+			zap.String("path", filePath),
+			zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al crear archivo"})
+		return
+	}
+	defer dst.Close()
+
+	// Copiar contenido
+	if _, err := io.Copy(dst, compressedFile); err != nil {
+		logger.Error("Error al guardar archivo",
+			zap.String("path", filePath),
+			zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al guardar archivo"})
+		return
+	}
+
+	// Establecer permisos
+	os.Chmod(filePath, 0644)
+
+	// Obtener tamaño final del archivo
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		logger.Error("Error al obtener información del archivo",
+			zap.String("path", filePath),
+			zap.Error(err))
+	}
+
+	// Generar respuesta
+	relativePath := filepath.Join(tenantID, filename)
+	publicURL := fmt.Sprintf("%s/files/%s", s.PublicURL, relativePath)
+
+	response := UploadResponse{
+		Path:         relativePath,
+		URL:          publicURL,
+		Size:         fileInfo.Size(),
+		MimeType:     mimeType,
+		Filename:     filename,
+		OriginalName: header.Filename,
+		TenantID:     tenantID,
+	}
+
+	logger.Info("Archivo guardado exitosamente",
+		zap.String("path", filePath),
+		zap.Int64("size", fileInfo.Size()),
+		zap.String("mimeType", mimeType))
+
+	c.JSON(http.StatusCreated, response)
+}
+
+func (s *ImageServer) isAllowedFileType(mimeType string) bool {
+	allowed := map[string]struct{}{
+		"image/jpeg":      {},
+		"image/png":       {},
+		"image/gif":       {},
+		"image/webp":      {},
+		"image/svg+xml":   {},
+		"application/pdf": {},
+		"application/vnd.openxmlformats-officedocument.wordprocessingml.document": {},
+		"application/msword": {},
+		"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {},
+		"application/vnd.ms-excel": {},
+		"text/csv":                 {},
+	}
+
+	_, exists := allowed[mimeType]
+	return exists
+}
+
+func (s *ImageServer) compressImage(src io.Reader, mimeType string) (io.Reader, error) {
+	if !strings.HasPrefix(mimeType, "image/") {
+		return src, nil
+	}
+
+	img, _, err := image.Decode(src)
+	if err != nil {
+		return nil, fmt.Errorf("error al decodificar imagen: %v", err)
+	}
+
+	var buf bytes.Buffer
+	switch mimeType {
+	case "image/jpeg":
+		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 85}); err != nil {
+			return nil, err
+		}
+	case "image/png":
+		if err := png.Encode(&buf, img); err != nil {
+			return nil, err
+		}
+	default:
+		return src, nil
+	}
+
+	return &buf, nil
+}
+
+func (s *ImageServer) deleteHandler(c *gin.Context) {
+	relativePath := c.Param("path")
+	filePath := filepath.Join(s.ImagesDir, relativePath)
+
+	// Verificar que el archivo existe
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Archivo no encontrado"})
+		return
+	}
+
+	// Eliminar archivo
+	if err := os.Remove(filePath); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al eliminar archivo"})
+		return
+	}
+
+	log.Printf("Archivo eliminado: %s", filePath)
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"path":    relativePath,
+	})
+}
+
+func (s *ImageServer) listHandler(c *gin.Context) {
+	tenantID := c.Query("path")
+	if tenantID == "" {
+		tenantID = c.GetHeader("x-tenant-id")
+	}
+	if tenantID == "" {
+		tenantID = "default"
+	}
+
+	tenantDir := filepath.Join(s.ImagesDir, tenantID)
+
+	// Verificar si el directorio existe
+	if _, err := os.Stat(tenantDir); os.IsNotExist(err) {
+		c.JSON(http.StatusOK, ListResponse{
+			Success:  true,
+			Files:    []FileInfo{},
+			Count:    0,
+			TenantID: tenantID,
+		})
+		return
+	}
+
+	// Leer archivos
+	entries, err := os.ReadDir(tenantDir)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al leer directorio"})
+		return
+	}
+
+	var files []FileInfo
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			relativePath := filepath.Join(tenantID, entry.Name())
+			publicURL := fmt.Sprintf("%s/files/%s", s.PublicURL, relativePath)
+
+			files = append(files, FileInfo{
+				Name:       entry.Name(),
+				Path:       relativePath,
+				Size:       info.Size(),
+				CreatedAt:  info.ModTime(),
+				ModifiedAt: info.ModTime(),
+				URL:        publicURL,
+			})
+		}
+	}
+
+	c.JSON(http.StatusOK, ListResponse{
+		Success:  true,
+		Files:    files,
+		Count:    len(files),
+		TenantID: tenantID,
+	})
+}
+
+func (s *ImageServer) serveFileHandler(c *gin.Context) {
+	relativePath := c.Param("path")
+	filePath := filepath.Join(s.ImagesDir, relativePath)
+
+	// Verificar que el archivo existe
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Archivo no encontrado"})
+		return
+	}
+
+	// Configurar headers de caché
+	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+
+	// Servir archivo
+	c.File(filePath)
+}
+
+func (s *ImageServer) quotaHandler(c *gin.Context) {
+	tenantID := c.Param("tenantId")
+
+	// Validar tenantID
+	matched, _ := regexp.MatchString(`^[a-zA-Z0-9_-]+$`, tenantID)
+	if !matched {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ID de tenant inválido"})
+		return
+	}
+
+	tenantDir := filepath.Join(s.ImagesDir, tenantID)
+
+	var totalSize int64
+	var fileCount int
+	filesByType := make(map[string]int)
+
+	// Caminar por el directorio recursivamente
+	filepath.Walk(tenantDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+
+		if !info.IsDir() {
+			totalSize += info.Size()
+			fileCount++
+
+			ext := strings.ToLower(filepath.Ext(info.Name()))
+			filesByType[ext]++
+		}
+		return nil
+	})
+
+	// Formatear tamaño
+	usedFormatted := formatSize(totalSize)
+	usedMB := fmt.Sprintf("%.2f", float64(totalSize)/(1024*1024))
+
+	response := QuotaResponse{
+		TenantID:      tenantID,
+		UsedBytes:     totalSize,
+		UsedFormatted: usedFormatted,
+		UsedMB:        usedMB,
+		FileCount:     fileCount,
+		FilesByType:   filesByType,
+		LastCheck:     time.Now().Format(time.RFC3339),
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+func formatSize(bytes int64) string {
+	if bytes < 1024 {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	if bytes < 1024*1024 {
+		return fmt.Sprintf("%.2f KB", float64(bytes)/1024)
+	}
+	if bytes < 1024*1024*1024 {
+		return fmt.Sprintf("%.2f MB", float64(bytes)/(1024*1024))
+	}
+	return fmt.Sprintf("%.2f GB", float64(bytes)/(1024*1024*1024))
+}
+
+func (s *ImageServer) healthHandler(c *gin.Context) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	response := HealthResponse{
+		Status:  "ok",
+		Version: getEnv("VERSION", "1.0.0"),
+		Uptime:  time.Now().Unix() - startTime,
+		MemoryUsage: map[string]interface{}{
+			"alloc":      m.Alloc,
+			"totalAlloc": m.TotalAlloc,
+			"sys":        m.Sys,
+			"numGC":      m.NumGC,
+		},
+		Environment: getEnv("NODE_ENV", "development"),
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+var startTime int64
+
+func main() {
+	startTime = time.Now().Unix()
+
+	// Inicializar logger
+	initLogger()
+	defer logger.Sync()
+
+	server := NewImageServer()
+
+	// Crear directorio de imágenes
+	if err := server.ensureImagesDir(); err != nil {
+		logger.Fatal("Error al crear directorio de imágenes", zap.Error(err))
+	}
+
+	// Configurar Gin
+	env := getEnv("NODE_ENV", "development")
+	if env == "production" {
+		gin.SetMode(gin.ReleaseMode)
+	} else {
+		gin.SetMode(gin.DebugMode)
+	}
+
+	r := gin.Default()
+
+	// Configuración de seguridad
+	r.Use(gin.Recovery())
+	r.Use(gin.LoggerWithConfig(gin.LoggerConfig{
+		SkipPaths: []string{"/health"},
+	}))
+
+	// Configurar proxies de confianza
+	if env == "production" {
+		// En producción, solo confiar en proxies específicos
+		trustedProxies := strings.Split(getEnv("TRUSTED_PROXIES", "127.0.0.1"), ",")
+		r.SetTrustedProxies(trustedProxies)
+		logger.Info("Proxies de confianza configurados",
+			zap.Strings("proxies", trustedProxies))
+	} else {
+		// En desarrollo, confiar en todos los proxies
+		r.SetTrustedProxies(nil)
+		logger.Info("Modo desarrollo: confiando en todos los proxies")
+	}
+
+	// CORS
+	corsConfig := cors.Config{
+		AllowMethods:     []string{"GET", "POST", "DELETE", "OPTIONS"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Tenant-ID"},
+		ExposeHeaders:    []string{"Content-Length"},
+		AllowCredentials: true,
+		MaxAge:           12 * time.Hour,
+	}
+
+	if env == "production" {
+		// En producción, solo permitir orígenes específicos
+		corsConfig.AllowOrigins = []string{getEnv("ALLOWED_ORIGINS", "http://localhost:3000")}
+	} else {
+		// En desarrollo, permitir todos los orígenes
+		corsConfig.AllowAllOrigins = true
+	}
+
+	r.Use(cors.New(corsConfig))
+
+	// Rutas públicas
+	r.GET("/health", server.healthHandler)
+
+	// Rutas de archivos
+	r.GET("/files/list", server.listHandler)
+	r.GET("/files/:path", server.serveFileHandler)
+
+	// Rutas protegidas
+	protected := r.Group("/")
+	protected.Use(server.authMiddleware())
+	{
+		protected.POST("/upload", server.uploadHandler)
+		protected.DELETE("/files/:path", server.deleteHandler)
+		protected.GET("/quota/:tenantId", server.quotaHandler)
+	}
+
+	logger.Info("Servidor iniciado",
+		zap.String("port", server.Port),
+		zap.String("imagesDir", server.ImagesDir),
+		zap.String("environment", env),
+		zap.Bool("production", env == "production"))
+
+	r.Run(":" + server.Port)
+}
