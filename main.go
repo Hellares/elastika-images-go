@@ -653,6 +653,26 @@ func (s *ImageServer) healthHandler(c *gin.Context) {
 	c.JSON(httpStatus, response)
 }
 
+// Función para manejar headers de NPM
+func (s *ImageServer) npmHeadersMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Headers que NPM suele agregar
+		if realIP := c.GetHeader("X-Real-IP"); realIP != "" {
+			c.Set("client_ip", realIP)
+		}
+		
+		if forwardedFor := c.GetHeader("X-Forwarded-For"); forwardedFor != "" {
+			c.Set("forwarded_for", forwardedFor)
+		}
+		
+		if forwardedProto := c.GetHeader("X-Forwarded-Proto"); forwardedProto != "" {
+			c.Set("forwarded_proto", forwardedProto)
+		}
+		
+		c.Next()
+	}
+}
+
 var startTime int64
 
 func main() {
@@ -685,30 +705,54 @@ func main() {
 		SkipPaths: []string{"/health"},
 	}))
 
-	// Configurar proxies de confianza
-	if env == "production" {
-		trustedProxies := strings.Split(getEnv("TRUSTED_PROXIES", "127.0.0.1"), ",")
-		r.SetTrustedProxies(trustedProxies)
-		logger.Info("Proxies de confianza configurados",
-			zap.Strings("proxies", trustedProxies))
-	} else {
-		r.SetTrustedProxies(nil)
-		logger.Info("Modo desarrollo: confiando en todos los proxies")
-	}
+	// NUEVO: Middleware para headers de NPM
+	r.Use(server.npmHeadersMiddleware())
 
-	// CORS
+	// // Configurar proxies de confianza
+	// if env == "production" {
+	// 	trustedProxies := strings.Split(getEnv("TRUSTED_PROXIES", "127.0.0.1"), ",")
+	// 	r.SetTrustedProxies(trustedProxies)
+	// 	logger.Info("Proxies de confianza configurados",
+	// 		zap.Strings("proxies", trustedProxies))
+	// } else {
+	// 	r.SetTrustedProxies(nil)
+	// 	logger.Info("Modo desarrollo: confiando en todos los proxies")
+	// }
+	// Configurar proxies de confianza para NPM
+	trustedProxies := strings.Split(getEnv("TRUSTED_PROXIES", "127.0.0.1,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16"), ",")
+	r.SetTrustedProxies(trustedProxies)
+	logger.Info("Proxies de confianza configurados para NPM",
+		zap.Strings("proxies", trustedProxies))
+
+	// // CORS
+	// corsConfig := cors.Config{
+	// 	AllowMethods:     []string{"GET", "POST", "DELETE", "OPTIONS"},
+	// 	AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Tenant-ID"},
+	// 	ExposeHeaders:    []string{"Content-Length"},
+	// 	AllowCredentials: true,
+	// 	MaxAge:           12 * time.Hour,
+	// }
+	// CORS actualizado para tu dominio
 	corsConfig := cors.Config{
-		AllowMethods:     []string{"GET", "POST", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Tenant-ID"},
-		ExposeHeaders:    []string{"Content-Length"},
+		AllowMethods:     []string{"GET", "POST", "DELETE", "OPTIONS", "HEAD"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Tenant-ID", "X-Real-IP", "X-Forwarded-For", "X-Forwarded-Proto", "X-Forwarded-Host"},
+		ExposeHeaders:    []string{"Content-Length", "Content-Type", "Cache-Control"},
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
 	}
 
+	// if env == "production" {
+	// 	corsConfig.AllowOrigins = strings.Split(getEnv("ALLOWED_ORIGINS", "http://localhost:3000"), ",")
+	// } else {
+	// 	corsConfig.AllowAllOrigins = true
+	// }
 	if env == "production" {
-		corsConfig.AllowOrigins = strings.Split(getEnv("ALLOWED_ORIGINS", "http://localhost:3000"), ",")
+		allowedOrigins := strings.Split(getEnv("ALLOWED_ORIGINS", "https://images.syncronize.net.pe"), ",")
+		corsConfig.AllowOrigins = allowedOrigins
+		logger.Info("CORS configurado para producción", zap.Strings("origins", allowedOrigins))
 	} else {
 		corsConfig.AllowAllOrigins = true
+		logger.Info("CORS configurado para desarrollo: permitir todos los orígenes")
 	}
 
 	r.Use(cors.New(corsConfig))
@@ -725,6 +769,8 @@ func main() {
 			"service": "Elastika Images Server",
 			"status":  "running",
 			"version": getEnv("VERSION", "1.0.0"),
+			"domain":  "images.syncronize.net.pe",
+			"npm":     true,
 		})
 	})
 
@@ -754,6 +800,7 @@ func main() {
 		zap.String("port", server.Port),
 		zap.String("imagesDir", server.ImagesDir),
 		zap.String("environment", env),
+		zap.String("domain", "images.syncronize.net.pe"),
 		zap.String("publicURL", server.PublicURL))
 
 	r.Run(":" + server.Port)

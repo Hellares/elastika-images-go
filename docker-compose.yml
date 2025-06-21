@@ -13,11 +13,11 @@ services:
       NODE_ENV: production
       IMAGES_DIR: /var/www/images
       API_KEY: ${IMAGES_API_KEY:-mathidev369}
-      PUBLIC_URL: ${PUBLIC_URL:-http://86.48.26.221}
+      PUBLIC_URL: https://images.syncronize.net.pe
       MAX_FILE_SIZE: ${MAX_FILE_SIZE:-20}
       VERSION: 1.0.0
-      TRUSTED_PROXIES: "172.16.0.0/12,10.0.0.0/8,127.0.0.1,172.19.0.0/16"
-      ALLOWED_ORIGINS: "*"
+      TRUSTED_PROXIES: "172.16.0.0/12,10.0.0.0/8,127.0.0.1,192.168.0.0/16"
+      ALLOWED_ORIGINS: "https://images.syncronize.net.pe,https://*.syncronize.net.pe"
     expose:
       - "3500"  # Solo interno
     volumes:
